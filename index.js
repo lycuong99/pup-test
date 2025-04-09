@@ -1,18 +1,17 @@
-// import puppeteer from "puppeteer";
-import axios from "axios";
-import antibotbrowser from "antibotbrowser";
+// import puppeteer from "puppeteer-extra";
+// import StealthPlugin from "puppeteer-extra-plugin-stealth";
 
-import puppeteer from "puppeteer-extra";
-import StealthPlugin from "puppeteer-extra-plugin-stealth";
-import { connect } from "puppeteer-real-browser";
-import { writeFile } from "fs/promises";
 import * as cheerio from "cheerio";
+import { getMangaList, saveToJsonFile } from "./file.js";
+import { avoidUnneccessaryResources, connectBrowser, navigateToPage } from "./browser.js";
+import { extractNumber, sleep } from "./utils.js";
 // Use stealth plugin to bypass detection
-puppeteer.use(StealthPlugin());
+// puppeteer.use(StealthPlugin());
 
 const url = "https://truyenqqto.com/truyen-moi-cap-nhat/trang-1.html?";
 
 const DOMAIN = "https://truyenqqto.com";
+const CRAW_PAGE = 3;
 
 function getMangaPage(index = 1) {
   return `${DOMAIN}/truyen-moi-cap-nhat/trang-${index}.html?`;
@@ -21,19 +20,13 @@ function getMangaPage(index = 1) {
 function* getNextPageUrl() {
   let index = 1;
   while (true) {
-    if (index > 20) return null;
+    if (index > CRAW_PAGE) return null;
     console.log("GO TO PAGE", index);
     yield getMangaPage(index++);
   }
 }
 
-async function sleep(duration) {
-  return new Promise((resolve) => {
-    setTimeout(resolve, duration);
-  });
-}
-
-const mangaList = [];
+let mangaList = [];
 function addMangaToList({ url, name, view, follow, types, lastChapter }) {
   mangaList.push({ url, name, view, follow, types, lastChapter });
 }
@@ -52,23 +45,132 @@ async function crawManagaList(page) {
   }
 }
 
+function getTotalPage(str) {
+  if (!str) return 1;
+  const match = str.match(/loadComment\((\d+)\)/);
+  return match ? parseInt(match[1], 10) : null;
+}
+
 /**
  * @param {import("puppeteer-real-browser").PageWithCursor} page - The ID of the book.
  */
 async function crawManagaComment(page, { url }) {
-  await navigateToPage(page, DOMAIN + url);
-  const pageContent = await page.content(); 
-}
+  try {
+    await navigateToPage(page, url);
 
-async function navigateToPage(page, url) {
-  await page.goto(url, { waitUntil: "domcontentloaded" });
-  const title = await page.title();
-  console.log(title);
+    const pageContent = await page.content();
+    const $ = cheerio.load(pageContent);
+    const totalPage = getTotalPage($(".page_redirect [onclick]").last().attr("onclick"));
 
-  if (title.includes("moment")) {
-    console.log("Waiting for Cloudflare challenge to complete...");
-    await sleep(2000);
-    await page.waitForNavigation({ timeout: 25000, waitUntil: "domcontentloaded" });
+    const comments = await page.evaluate(
+      async ({ totalPage }) => {
+        const comments = [];
+        const urlCommentLoad = `https://truyenqqto.com/frontend/comment/list`;
+
+        function getCommentId(str) {
+          const match = str.match(/loadReply\((\d+)\)/);
+          return match ? parseInt(match[1], 10) : null;
+        }
+
+        async function getComment(html) {
+          const itemComments = $(html).find(".item-comment").toArray();
+
+          const comments = [];
+          for (let itemComment of itemComments) {
+            let comment = $(itemComment).find(".content-comment").text().trim();
+
+            if (!comment) continue;
+
+            const haveReply = $(itemComment).find(".text-list-reply").length > 0;
+            if (haveReply) {
+              const commentId = getCommentId($(itemComment).find(".text-list-reply a").attr("href"));
+
+              const repliedComments = await loadReply(commentId);
+
+              if (repliedComments.length > 0) {
+                comment += `\n${repliedComments.join("\n")}`;
+              }
+            }
+
+            comments.push(comment);
+          }
+
+          return comments;
+        }
+        //from truyenqqto
+        async function loadComment(page) {
+          console.log("loadComment", page);
+          var book_id = $("#book_id").val();
+          var episode_id = $("#episode_id").val();
+          var team_id = $("#team_id").val();
+
+          return new Promise((resolve) => {
+            $.ajax({
+              method: "POST",
+              url: urlCommentLoad,
+              data: { book_id: book_id, parent_id: 0, page: page, episode_id: episode_id, team_id: team_id },
+            }).done(async function (html) {
+              resolve(await getComment(html));
+            });
+          });
+        }
+
+        async function loadReply(id) {
+          console.log("loadReply", id);
+          var book_id = $("#book_id").val();
+          var team_id = $("#team_id").val();
+          return new Promise((resolve) => {
+            $.ajax({
+              method: "POST",
+              url: urlCommentLoad,
+              data: { book_id: book_id, parent_id: id, team_id: team_id },
+            }).done(async function (html) {
+              resolve(await getComment(html));
+            });
+          });
+        }
+
+        const BATCH_SIZE = 10;
+
+        for (let i = 1; i <= totalPage; i += BATCH_SIZE) {
+          const batch = [];
+
+          for (let j = i; j < i + BATCH_SIZE && j <= totalPage; j++) {
+            batch.push(loadComment(j));
+          }
+
+          const results = await Promise.all(batch);
+
+          for (const commentHtmls of results) {
+            if (commentHtmls.length === 0) {
+              return comments; // Stop loading more pages if empty
+            }
+
+            console.log(commentHtmls);
+            comments.push(...commentHtmls);
+          }
+        }
+
+        // for (let i = 1; i <= totalPage; i++) {
+        //   const commentHtmls = await loadComment(i);
+
+        //   if (commentHtmls.length === 0) {
+        //     break;
+        //   }
+
+        //   console.log(commentHtmls);
+        //   comments.push(...commentHtmls);
+        // }
+
+        return comments;
+      },
+      { totalPage }
+    );
+    return comments;
+  } catch (error) {
+    // console.log(error);
+    console.trace("Retry:", error);
+    return crawManagaComment(page, { url });
   }
 }
 
@@ -79,13 +181,13 @@ function collectManagasOnPage(pageContent) {
     try {
       const mangaHref = $(element).find(".book_info .book_name a").attr("href");
       const mangaName = $(element).find(".book_info .book_name a").attr("title");
-      const lastChapter = $(element).find(".book_info .last_chapter").text().trim();
+      const lastChapter = extractNumber($(element).find(".book_info .last_chapter").text().trim());
+
       const [, view, follow] = $(element)
         .find(".book_info .more-info .info")
         .toArray()
-        .map((info) => $(info).text());
-      // const follow = moreInfos[4];
-      // const view = moreInfos[3];
+        .map((info) => extractNumber($(info).text()));
+
       const types = $(element)
         .find(".book_info .more-info .list-tags")
         .children()
@@ -107,54 +209,64 @@ function collectManagasOnPage(pageContent) {
   });
 }
 
-function saveToJsonFile(data) {
-  writeFile("mangaList.json", JSON.stringify(data, null, 2), "utf-8").then(() => {
-    console.log("Saved to mangaList.json");
-  });
-}
-
 async function scrapeTitle() {
-  // const antibrowser = await antibotbrowser.startbrowser(9222);
-  // const browser = await puppeteer.connect({browserWSEndpoint: antibrowser.websokcet});
+  const { browser, page } = await connectBrowser();
 
-  // const browser = await puppeteer.launch();
-  // const page = await browser.newPage();
-  const { browser, page } = await connect({
-    headless: false,
+  console.time("scrape Manga");
 
-    args: [],
+  // mangaList = await getMangaList();
 
-    customConfig: {},
+  // console.log(mangaList?.length);
+  // if (!mangaList) {
+  //   console.log("No manga list found");
+  //   mangaList = [];
+  // }
 
-    turnstile: true,
+  if (mangaList.length === 0) {
+    await crawManagaList(page);
+  }
 
-    connectOption: {},
+  console.timeEnd("scrape Manga");
 
-    disableXvfb: false,
-    ignoreAllFlags: false,
-    plugins: [(await import("puppeteer-extra-plugin-click-and-wait")).default()], // proxy:{
-    //     host:'<proxy-host>',
-    //     port:'<proxy-port>',
-    //     username:'<proxy-username>',
-    //     password:'<proxy-password>'
-    // }
+  console.time("scrape Manga Comment");
+
+  const pages = [page, await browser.newPage(), await browser.newPage(), await browser.newPage(), await browser.newPage()];
+
+  pages.forEach((page) => {
+    // avoidUnneccessaryResources(page);
   });
 
-  // Fake User-Agent
-  await page.setUserAgent(
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+  const pageCount = pages.length;
+
+  // Tạo mảng con: mỗi page nhận manga theo index phân phối
+  const mangaGroups = Array.from({ length: pageCount }, () => []);
+
+  for (let i = 0; i < mangaList.length; i++) {
+    const groupIndex = i % pageCount;
+    mangaGroups[groupIndex].push({ ...mangaList[i], index: i }); // lưu index nếu cần gán lại
+  }
+
+  await Promise.all(
+    mangaGroups.map((group, groupIndex) =>
+      (async () => {
+        const page = pages[groupIndex];
+        for (const manga of group) {
+          console.log(`Page ${groupIndex} craw comment`, manga.index, manga.name);
+          const comments = await crawManagaComment(page, {
+            url: DOMAIN + manga.url,
+          });
+          console.log(`Page ${groupIndex} crawed comment`, manga.name, comments.length);
+          mangaList[manga.index].comments = comments; // gán đúng chỗ
+        }
+      })()
+    )
   );
-
-  // Fake Headers
-  await page.setExtraHTTPHeaders({
-    "Accept-Language": "en-US,en;q=0.9",
-    Referer: "https://www.google.com/",
-  });
-
-  crawManagaList(page);
 
   saveToJsonFile(mangaList);
 
+  console.timeEnd("scrape Manga Comment");
+
   return "Done";
 }
+
 scrapeTitle(url).then(console.log);
