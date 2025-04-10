@@ -4,7 +4,7 @@
 import * as cheerio from "cheerio";
 import { getMangaList, saveToJsonFile } from "./file.js";
 import { avoidUnneccessaryResources, connectBrowser, navigateToPage } from "./browser.js";
-import { extractNumber, sleep } from "./utils.js";
+import { extractNumber, handleCommentText, sleep } from "./utils.js";
 // Use stealth plugin to bypass detection
 // puppeteer.use(StealthPlugin());
 
@@ -77,7 +77,7 @@ async function crawManagaComment(page, { url }) {
 
           const comments = [];
           for (let itemComment of itemComments) {
-            let comment = $(itemComment).find(".content-comment").text().trim();
+            let comment = handleCommentText($(itemComment).find(".content-comment").text());
 
             if (!comment) continue;
 
@@ -88,7 +88,7 @@ async function crawManagaComment(page, { url }) {
               const repliedComments = await loadReply(commentId);
 
               if (repliedComments.length > 0) {
-                comment += `\n${repliedComments.join("\n")}`;
+                comment += `\n\t${repliedComments.join("\n")}`;
               }
             }
 
@@ -162,7 +162,7 @@ async function crawManagaComment(page, { url }) {
         //   comments.push(...commentHtmls);
         // }
 
-        return comments;
+        return [...new Set(comments)];
       },
       { totalPage }
     );
@@ -232,10 +232,24 @@ async function scrapeTitle() {
 
   const pages = [page, await browser.newPage(), await browser.newPage(), await browser.newPage(), await browser.newPage()];
 
-  pages.forEach((page) => {
-    // avoidUnneccessaryResources(page);
-  });
+  for (const page of pages) {
+    await page.setRequestInterception(true);
 
+    page.on("request", (req) => {
+      const url = req.url();
+      if (
+        url.includes("ads") ||
+        url.includes("doubleclick") ||
+        url.includes("googlesyndication") ||
+        url.includes("taboola") ||
+        url.includes("facebook") // iframes quảng cáo
+      ) {
+        req.abort();
+      } else {
+        req.continue();
+      }
+    });
+  }
   const pageCount = pages.length;
 
   // Tạo mảng con: mỗi page nhận manga theo index phân phối
